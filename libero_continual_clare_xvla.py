@@ -751,6 +751,85 @@ def apply_policy_feature_compatibility(meta: Any, policy_cfg: Any, rename_map: d
         apply_rename_map_to_mapping(stats, rename_map)
 
 
+def prefix_regex_pattern(pattern: str, prefix: str) -> str:
+    escaped_prefix = re.escape(prefix)
+    if pattern.startswith("^"):
+        return "^" + escaped_prefix + pattern[1:]
+    return escaped_prefix + pattern
+
+
+def count_matching_clare_targets(peft_cfg: Any, model: Any) -> int:
+    get_module_config = getattr(peft_cfg, "get_module_config", None)
+    if get_module_config is None:
+        return 0
+    count = 0
+    for name, _module in model.named_modules():
+        if get_module_config(name) is not None:
+            count += 1
+    return count
+
+
+def rebuild_clare_module_configs(peft_cfg: Any) -> None:
+    if hasattr(peft_cfg, "_module_configs"):
+        peft_cfg._module_configs = {}
+    process = getattr(peft_cfg, "_process_module_configs", None)
+    if process is not None:
+        process()
+
+
+def prefix_clare_target_modules(peft_cfg: Any, prefix: str) -> None:
+    target_modules = getattr(peft_cfg, "target_modules", None)
+    if isinstance(target_modules, str):
+        peft_cfg.target_modules = prefix_regex_pattern(target_modules, prefix)
+    elif isinstance(target_modules, dict):
+        prefixed: dict[str, Any] = {}
+        for pattern, module_cfg in target_modules.items():
+            prefixed_pattern = prefix_regex_pattern(str(pattern), prefix)
+            module_cfg = copy.deepcopy(module_cfg)
+            if hasattr(module_cfg, "pattern"):
+                module_cfg.pattern = prefixed_pattern
+            prefixed[prefixed_pattern] = module_cfg
+        peft_cfg.target_modules = prefixed
+    elif isinstance(target_modules, list):
+        prefixed_list = []
+        for module_cfg in target_modules:
+            module_cfg = copy.deepcopy(module_cfg)
+            if isinstance(module_cfg, dict):
+                pattern = module_cfg.get("pattern")
+                if pattern is not None:
+                    module_cfg["pattern"] = prefix_regex_pattern(str(pattern), prefix)
+            elif hasattr(module_cfg, "pattern"):
+                module_cfg.pattern = prefix_regex_pattern(str(module_cfg.pattern), prefix)
+            prefixed_list.append(module_cfg)
+        peft_cfg.target_modules = prefixed_list
+    rebuild_clare_module_configs(peft_cfg)
+
+
+def ensure_clare_targets_match_wrapped_model(peft_cfg: Any, model: Any, wrapper_prefix: str = "policy.") -> int:
+    match_count = count_matching_clare_targets(peft_cfg, model)
+    if match_count > 0:
+        return match_count
+    original_targets = copy.deepcopy(getattr(peft_cfg, "target_modules", None))
+    original_module_configs = copy.deepcopy(getattr(peft_cfg, "_module_configs", {}))
+    prefix_clare_target_modules(peft_cfg, wrapper_prefix)
+    match_count = count_matching_clare_targets(peft_cfg, model)
+    if match_count > 0:
+        print(
+            "Adjusted CLARE target module patterns for wrapped X-VLA policy "
+            f"using prefix {wrapper_prefix!r}; matched {match_count} modules."
+        )
+        return match_count
+    peft_cfg.target_modules = original_targets
+    if hasattr(peft_cfg, "_module_configs"):
+        peft_cfg._module_configs = original_module_configs
+    examples = [name for name, _module in list(model.named_modules())[:40]]
+    raise RuntimeError(
+        "CLARE target modules do not match the wrapped X-VLA model. "
+        f"Example wrapped module names: {examples}. "
+        "Regenerate the CLARE config or set CLARE_TARGET_REGEX to match wrapped policy modules."
+    )
+
+
 def module_is_excluded(name: str) -> bool:
     lowered = name.lower()
     excluded_tokens = (
@@ -812,7 +891,14 @@ def generate_clare_config(config: Config) -> Path:
         out_features = int(getattr(module, "out_features", 0))
         if in_features <= 0 or out_features <= 0:
             continue
-        selected.append({"name": name, "in_features": in_features, "out_features": out_features})
+        selected.append(
+            {
+                "name": name,
+                "peft_name": f"policy.{name}",
+                "in_features": in_features,
+                "out_features": out_features,
+            }
+        )
         if len(selected) >= config.clare_max_target_modules:
             break
 
@@ -826,11 +912,11 @@ def generate_clare_config(config: Config) -> Path:
 
     print(f"Selected {len(selected)} CLARE target modules.")
     for item in selected[:10]:
-        print(f"  - {item['name']} ({item['in_features']} -> {item['out_features']})")
+        print(f"  - {item['peft_name']} ({item['in_features']} -> {item['out_features']})")
 
     target_modules: dict[str, dict[str, Any]] = {}
     for item in selected:
-        pattern = "^" + re.escape(item["name"]) + "$"
+        pattern = "^" + re.escape(item["peft_name"]) + "$"
         target_modules[pattern] = {
             "feature_dim": item["in_features"],
             "out_feature_dim": item["out_features"],
@@ -1421,6 +1507,8 @@ def run_clare_train_child(train_args: list[str]) -> int:
         else:
             peft_cfg = PeftConfig.from_pretrained(cfg.peft_cfg_path)
             peft_cfg.inference_mode = False
+            matched_targets = ensure_clare_targets_match_wrapped_model(peft_cfg, wrapper)
+            logging.info("CLARE target patterns matched %s wrapped policy modules", matched_targets)
             peft_policy = get_peft_model(wrapper, peft_cfg)
             peft_config = peft_policy.peft_config["default"]
 
