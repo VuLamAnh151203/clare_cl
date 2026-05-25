@@ -107,6 +107,7 @@ export POSTPROCESSOR_DEVICE="${POSTPROCESSOR_DEVICE:-cpu}"
 # ============================================================
 
 export CLARE_ROOT="${CLARE_ROOT:-${SCRIPT_DIR}/clare}"
+export CLARE_PEFT_SRC="${CLARE_PEFT_SRC:-}"
 export CLARE_INSTALL_EDITABLE="${CLARE_INSTALL_EDITABLE:-0}"
 export CLARE_CONFIG_PATH="${CLARE_CONFIG_PATH:-}"
 export CLARE_REGENERATE_CONFIG="${CLARE_REGENERATE_CONFIG:-0}"

@@ -519,20 +519,29 @@ def convert_datasets(config: Config) -> None:
 
 
 def ensure_clare_peft_path(clare_root: Path) -> Path:
-    peft_src = clare_root / "peft_lsy" / "src"
+    explicit_peft_src = env("CLARE_PEFT_SRC", "").strip()
+    peft_src = Path(explicit_peft_src).expanduser() if explicit_peft_src else clare_root / "peft_lsy" / "src"
     if not peft_src.exists():
         existing = []
         if clare_root.exists():
             existing = sorted(path.name for path in clare_root.iterdir())
+        hint = (
+            "Set CLARE_PEFT_SRC directly to the folder containing the peft package, for example "
+            "`/kaggle/input/<dataset>/peft_lsy/src`, or upload the missing `clare/peft_lsy` folder."
+            if explicit_peft_src
+            else "Upload the full clare folder including `peft_lsy`, or set CLARE_PEFT_SRC to a folder "
+            "containing `peft`."
+        )
         raise RuntimeError(
             f"Cannot find local CLARE PEFT source: {peft_src}. "
             f"CLARE_ROOT is {clare_root}. Entries there: {existing}. "
-            "Upload the full clare folder, or set CLARE_ROOT to the folder containing peft_lsy/src/peft."
+            f"{hint}"
         )
     if not (peft_src / "peft").exists():
         raise RuntimeError(
             f"CLARE PEFT source is missing the peft package: {peft_src / 'peft'}. "
-            "Upload clare/peft_lsy/src/peft completely."
+            "CLARE_PEFT_SRC must point to the `src` directory, not to `peft_lsy` itself. "
+            "Expected layout: CLARE_PEFT_SRC/peft/tuners/clare/..."
         )
     peft_src_str = str(peft_src.resolve())
     if peft_src_str not in sys.path:
