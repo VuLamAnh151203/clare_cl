@@ -616,6 +616,41 @@ def validate_runtime_imports(config: Config) -> None:
         ) from exc
 
 
+def import_lerobot_runtime_helpers() -> tuple[Any, Any]:
+    import logging
+
+    import torch
+
+    try:
+        from lerobot.utils.utils import init_logging as lerobot_init_logging
+    except ImportError:
+
+        def lerobot_init_logging() -> None:
+            logging.basicConfig(level=logging.INFO)
+
+    try:
+        from lerobot.utils.utils import get_safe_torch_device as lerobot_get_safe_torch_device
+    except ImportError:
+
+        def lerobot_get_safe_torch_device(device: str | torch.device | None, log: bool = False) -> torch.device:
+            requested = str(device or "cuda")
+            torch_device = torch.device(requested)
+            if torch_device.type == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError(
+                    f"CUDA device was requested ({requested}), but torch.cuda.is_available() is false. "
+                    "Set DEVICE=cpu or enable a GPU runtime."
+                )
+            if torch_device.type == "mps":
+                mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+                if not mps_available:
+                    raise RuntimeError("MPS device was requested, but it is not available.")
+            if log:
+                logging.info("Using torch device: %s", torch_device)
+            return torch_device
+
+    return lerobot_get_safe_torch_device, lerobot_init_logging
+
+
 def module_is_excluded(name: str) -> bool:
     lowered = name.lower()
     excluded_tokens = (
@@ -1060,9 +1095,10 @@ def run_clare_train_child(train_args: list[str]) -> int:
     from lerobot.policies.pretrained import PreTrainedPolicy
     from lerobot.policies.utils import get_device_from_parameters
     from lerobot.utils.random_utils import set_seed
-    from lerobot.utils.utils import get_safe_torch_device, init_logging
     from peft import PeftConfig, PeftModel, get_peft_model
     from peft.mapping import PEFT_TYPE_TO_PREFIX_MAPPING
+
+    get_safe_torch_device, init_logging = import_lerobot_runtime_helpers()
 
     class PeftWrapperPolicy(torch.nn.Module):
         policy: PreTrainedPolicy
@@ -1419,8 +1455,9 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
     from lerobot.policies.pretrained import PreTrainedPolicy
     from lerobot.scripts.eval import eval_policy
     from lerobot.utils.random_utils import set_seed
-    from lerobot.utils.utils import get_safe_torch_device, init_logging
     from peft import PeftModel
+
+    get_safe_torch_device, init_logging = import_lerobot_runtime_helpers()
 
     class PeftWrapperPolicy(torch.nn.Module):
         policy: PreTrainedPolicy
