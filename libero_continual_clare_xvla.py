@@ -206,6 +206,7 @@ class Config:
     scheduler_decay_steps: int
     scheduler_decay_lr: str
     action_mode: str
+    policy_use_proprio: bool
     policy_num_image_views: int | None
     policy_empty_cameras: int | None
     freeze_vision_encoder: bool
@@ -340,6 +341,7 @@ def load_config() -> Config:
         scheduler_decay_steps=parse_int("SCHEDULER_DECAY_STEPS", 30000),
         scheduler_decay_lr=env("SCHEDULER_DECAY_LR", "2.5e-6"),
         action_mode=env("ACTION_MODE", "ee6d"),
+        policy_use_proprio=parse_bool("POLICY_USE_PROPRIO", True),
         policy_num_image_views=parse_optional_int("POLICY_NUM_IMAGE_VIEWS"),
         policy_empty_cameras=parse_optional_int("POLICY_EMPTY_CAMERAS"),
         freeze_vision_encoder=parse_bool("FREEZE_VISION_ENCODER", False),
@@ -1026,6 +1028,7 @@ def build_common_train_args(config: Config, suite: str, output_dir: Path) -> lis
         f"--policy.scheduler_decay_steps={config.scheduler_decay_steps}",
         f"--policy.scheduler_decay_lr={config.scheduler_decay_lr}",
         f"--policy.action_mode={config.action_mode}",
+        f"--policy.use_proprio={cli_bool(config.policy_use_proprio)}",
         f"--policy.tokenizer_name={config.tokenizer_name}",
         f"--policy.tokenizer_max_length={config.tokenizer_max_length}",
         f"--policy.freeze_vision_encoder={cli_bool(config.freeze_vision_encoder)}",
@@ -1104,11 +1107,13 @@ def build_eval_args(config: Config, adapter_checkpoint: Path, suite: str, output
         f"--eval.n_episodes={config.n_eval_episodes}",
         f"--policy.device={config.device}",
         f"--policy.action_mode={config.action_mode}",
+        f"--policy.use_proprio={cli_bool(config.policy_use_proprio)}",
         f"--policy.tokenizer_name={config.tokenizer_name}",
         f"--policy.tokenizer_max_length={config.tokenizer_max_length}",
         f"--rename_map={rename_map}",
         f"--tokenizer_task_key={config.tokenizer_task_key}",
         f"--domain_id={config.domain_id}",
+        f"--proprio_dim={config.state_shape[-1] if config.state_shape else 0}",
     ]
     if config.policy_num_image_views is not None:
         args.append(f"--policy.num_image_views={config.policy_num_image_views}")
@@ -1328,6 +1333,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
         OBS_LANGUAGE_TOKENS = "observation.language.tokens"
 
     OBS_LANGUAGE_ATTENTION_MASK = "observation.language.attention_mask"
+    OBS_STATE = "observation.state"
 
     class PeftWrapperPolicy(torch.nn.Module):
         policy: PreTrainedPolicy
@@ -1868,6 +1874,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         rename_map: dict[str, str] = field(default_factory=dict)
         tokenizer_task_key: str = "task"
         domain_id: int = 3
+        proprio_dim: int = 8
 
     update_dataclass_type_hints(
         CLAREEvalPipelineConfig,
@@ -1877,6 +1884,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             "rename_map": dict[str, str],
             "tokenizer_task_key": str,
             "domain_id": int,
+            "proprio_dim": int,
         },
     )
 
@@ -1942,6 +1950,55 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             batch["domain_id"] = torch.full((batch_size,), int(cfg.domain_id), dtype=torch.long)
         return batch
 
+    def as_state_tensor(value: Any) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value
+        if isinstance(value, np.ndarray):
+            return torch.from_numpy(value)
+        if isinstance(value, (list, tuple)):
+            return torch.as_tensor(value)
+        return None
+
+    def ensure_xvla_proprio_state(batch: dict[str, Any], cfg: CLAREEvalPipelineConfig) -> dict[str, Any]:
+        proprio_dim = int(getattr(cfg, "proprio_dim", 0) or 0)
+        if proprio_dim <= 0:
+            return batch
+        batch_size = infer_batch_size(batch)
+        state = as_state_tensor(batch.get(OBS_STATE))
+        if state is None:
+            batch[OBS_STATE] = torch.zeros((batch_size, proprio_dim), dtype=torch.float32)
+            return batch
+
+        if not torch.is_floating_point(state):
+            state = state.float()
+        if state.ndim == 0:
+            state = state.reshape(1, 1)
+        elif state.ndim == 1:
+            if state.numel() == proprio_dim:
+                state = state.reshape(1, proprio_dim)
+            elif state.numel() == batch_size * proprio_dim:
+                state = state.reshape(batch_size, proprio_dim)
+            else:
+                state = state.reshape(batch_size, -1) if state.numel() % max(batch_size, 1) == 0 else state.reshape(1, -1)
+
+        current_dim = int(state.shape[-1]) if state.ndim > 0 else 0
+        if current_dim == proprio_dim:
+            batch[OBS_STATE] = state
+            return batch
+
+        target_shape = (*state.shape[:-1], proprio_dim)
+        if current_dim == 0:
+            batch[OBS_STATE] = torch.zeros(target_shape, dtype=state.dtype, device=state.device)
+        elif current_dim < proprio_dim:
+            pad_shape = (*state.shape[:-1], proprio_dim - current_dim)
+            padding = torch.zeros(pad_shape, dtype=state.dtype, device=state.device)
+            batch[OBS_STATE] = torch.cat([state, padding], dim=-1)
+        else:
+            batch[OBS_STATE] = state[..., :proprio_dim]
+        return batch
+
     def prepare_eval_batch(
         batch: Any,
         cfg: CLAREEvalPipelineConfig,
@@ -1952,6 +2009,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             return batch
         batch = apply_rename_map_to_batch(batch, cfg.rename_map or {})
         batch = add_xvla_language_and_domain(batch, cfg, tokenizer)
+        batch = ensure_xvla_proprio_state(batch, cfg)
         return move_batch_to_device(batch, device)
 
     def success_list_from_info(info: dict[str, Any], num_envs: int) -> list[bool]:
