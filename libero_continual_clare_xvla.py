@@ -1435,6 +1435,53 @@ def run_clare_train_child(train_args: list[str]) -> int:
             params.extend(group["params"])
         return params
 
+    def named_parameters_for_optimizer(
+        root_module: torch.nn.Module,
+        parameters: list[torch.nn.Parameter],
+        fallback_prefix: str,
+    ) -> dict[str, torch.nn.Parameter]:
+        target_ids = {id(parameter) for parameter in parameters}
+        found_ids: set[int] = set()
+        named_params: dict[str, torch.nn.Parameter] = {}
+        for name, parameter in root_module.named_parameters():
+            parameter_id = id(parameter)
+            if parameter_id in target_ids and parameter_id not in found_ids and parameter.requires_grad:
+                named_params[name] = parameter
+                found_ids.add(parameter_id)
+        for index, parameter in enumerate(parameters):
+            parameter_id = id(parameter)
+            if parameter_id in found_ids or not parameter.requires_grad:
+                continue
+            named_params[f"{fallback_prefix}.{index}"] = parameter
+            found_ids.add(parameter_id)
+        if not named_params:
+            raise RuntimeError(f"No trainable named parameters were found for {fallback_prefix}.")
+        return named_params
+
+    def build_optimizer_compatible(
+        optimizer_config: OptimizerConfig,
+        named_params: dict[str, torch.nn.Parameter],
+        label: str,
+    ) -> Optimizer:
+        try:
+            optimizer = optimizer_config.build(named_params)
+        except Exception as first_exc:
+            try:
+                optimizer = optimizer_config.build(list(named_params.values()))
+            except Exception:
+                raise first_exc
+            logging.info(
+                "Built %s optimizer with parameter list fallback for optimizer config %s",
+                label,
+                type(optimizer_config).__name__,
+            )
+        if isinstance(optimizer, dict):
+            raise RuntimeError(
+                f"{label} optimizer config returned multiple optimizers, which this CLARE loop does not support."
+            )
+        logging.info("Built %s optimizer over %s named parameters", label, len(named_params))
+        return optimizer
+
     def update_policy(
         policy: PreTrainedPolicy,
         peft_modules: list[Any],
@@ -1575,11 +1622,22 @@ def run_clare_train_child(train_args: list[str]) -> int:
         if not discriminator_params:
             raise RuntimeError("No discriminator parameters were selected for training.")
 
-        adapter_optimizer = cfg.optimizer.build(adapter_params)
+        adapter_named_params = named_parameters_for_optimizer(peft_policy, adapter_params, "clare_adapter")
+        discriminator_named_params = named_parameters_for_optimizer(
+            peft_policy,
+            discriminator_params,
+            "clare_discriminator",
+        )
+
+        adapter_optimizer = build_optimizer_compatible(cfg.optimizer, adapter_named_params, "adapter")
         adapter_scheduler = None
         if cfg.scheduler:
             adapter_scheduler = cfg.scheduler.build(adapter_optimizer, cfg.steps)
-        discriminator_optimizer = cfg.train_discriminator_optimizer.build(discriminator_params)
+        discriminator_optimizer = build_optimizer_compatible(
+            cfg.train_discriminator_optimizer,
+            discriminator_named_params,
+            "discriminator",
+        )
         discriminator_scheduler = None
         if cfg.train_discriminator_lr_scheduler:
             discriminator_scheduler = cfg.train_discriminator_lr_scheduler.build(
