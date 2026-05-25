@@ -751,6 +751,22 @@ def apply_policy_feature_compatibility(meta: Any, policy_cfg: Any, rename_map: d
         apply_rename_map_to_mapping(stats, rename_map)
 
 
+def make_policy_compatible_metadata(meta: Any, policy_cfg: Any, rename_map: dict[str, str]) -> Any:
+    policy_meta = copy.deepcopy(meta)
+    apply_policy_feature_compatibility(policy_meta, policy_cfg, rename_map)
+    return policy_meta
+
+
+def apply_rename_map_to_batch(batch: dict[str, Any], rename_map: dict[str, str]) -> dict[str, Any]:
+    for source, target in rename_map.items():
+        if source not in batch:
+            continue
+        if target not in batch:
+            batch[target] = batch[source]
+        del batch[source]
+    return batch
+
+
 def prefix_regex_pattern(pattern: str, prefix: str) -> str:
     escaped_prefix = re.escape(prefix)
     if pattern.startswith("^"):
@@ -1361,6 +1377,14 @@ def run_clare_train_child(train_args: list[str]) -> int:
                 batch[key] = batch[key].to(device, non_blocking=device.type == "cuda")
         return batch
 
+    def prepare_batch(
+        batch: dict[str, Any],
+        device: torch.device,
+        rename_map: dict[str, str],
+    ) -> dict[str, Any]:
+        batch = apply_rename_map_to_batch(batch, rename_map)
+        return move_batch_to_device(batch, device)
+
     def detect_distribution_shift(
         cfg: CLARETrainPipelineConfig,
         policy: PreTrainedPolicy,
@@ -1386,7 +1410,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
         losses_sum: dict[str, list[float]] = {}
         step = 0
         for _ in range(cfg.detect_distribution_shift_steps):
-            batch = move_batch_to_device(next(detect_iter), device)
+            batch = prepare_batch(next(detect_iter), device, getattr(cfg, "rename_map", {}) or {})
             with torch.inference_mode():
                 policy.forward(batch)
             for peft_module in peft_modules:
@@ -1538,8 +1562,8 @@ def run_clare_train_child(train_args: list[str]) -> int:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
         logging.info("Creating X-VLA policy")
-        apply_policy_feature_compatibility(dataset.meta, cfg.policy, getattr(cfg, "rename_map", {}) or {})
-        policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta)
+        policy_meta = make_policy_compatible_metadata(dataset.meta, cfg.policy, getattr(cfg, "rename_map", {}) or {})
+        policy = make_policy(cfg=cfg.policy, ds_meta=policy_meta)
         policy.eval()
         wrapper = PeftWrapperPolicy(policy=policy)
 
@@ -1654,7 +1678,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
             peft_module.train_discriminator(False)
             peft_module.update_stats(False)
         for _ in range(cfg.steps):
-            batch = move_batch_to_device(next(iterator), device)
+            batch = prepare_batch(next(iterator), device, getattr(cfg, "rename_map", {}) or {})
             loss = update_policy(
                 policy,
                 peft_modules,
@@ -1674,7 +1698,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
             peft_module.train_discriminator(True)
             peft_module.update_stats(True)
         for _ in range(cfg.train_discriminators_steps):
-            batch = move_batch_to_device(next(iterator), device)
+            batch = prepare_batch(next(iterator), device, getattr(cfg, "rename_map", {}) or {})
             loss = update_policy(
                 policy,
                 peft_modules,
@@ -1754,8 +1778,8 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         set_seed(cfg.seed)
         env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
         ds_meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
-        apply_policy_feature_compatibility(ds_meta, cfg.policy, cfg.rename_map or {})
-        policy = make_policy(cfg=cfg.policy, ds_meta=ds_meta)
+        policy_meta = make_policy_compatible_metadata(ds_meta, cfg.policy, cfg.rename_map or {})
+        policy = make_policy(cfg=cfg.policy, ds_meta=policy_meta)
         wrapper = PeftWrapperPolicy(policy=policy)
         peft_policy = PeftModel.from_pretrained(
             wrapper,
