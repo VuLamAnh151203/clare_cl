@@ -517,9 +517,36 @@ def copy_datasets(config: Config) -> None:
         shutil.copytree(source, target)
 
 
+def dataset_codebase_version(root: Path) -> str | None:
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        return None
+    try:
+        with info_path.open("r", encoding="utf-8") as file:
+            info = json.load(file)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Dataset info file is not valid JSON: {info_path}") from exc
+    version = info.get("codebase_version")
+    return str(version) if version is not None else None
+
+
 def convert_datasets(config: Config) -> None:
     for suite in config.convert_suites:
         root = require_dataset_root(config, suite)
+        version = dataset_codebase_version(root)
+        if version == "v3.0":
+            print(f"Dataset already converted to v3.0; skipping conversion for {suite}: {root}")
+            continue
+        if version and version != "v2.1":
+            raise ValueError(
+                f"Dataset {suite} has unsupported codebase_version '{version}' at {root}. "
+                "This workflow can convert v2.1 datasets to v3.0, or skip datasets already at v3.0."
+            )
+        if version is None:
+            print(
+                f"Dataset version could not be detected for {suite} at {root}; "
+                "running the LeRobot converter and letting it validate the dataset."
+            )
         run_command(
             [
                 sys.executable,
