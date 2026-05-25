@@ -678,6 +678,14 @@ def import_lerobot_runtime_helpers() -> tuple[Any, Any]:
     return lerobot_get_safe_torch_device, lerobot_init_logging
 
 
+def update_dataclass_type_hints(dataclass_type: type[Any], hints: dict[str, Any]) -> None:
+    dataclass_type.__annotations__.update(hints)
+    dataclass_fields = getattr(dataclass_type, "__dataclass_fields__", {})
+    for name, hint in hints.items():
+        if name in dataclass_fields:
+            dataclass_fields[name].type = hint
+
+
 def module_is_excluded(name: str) -> bool:
     lowered = name.lower()
     excluded_tokens = (
@@ -1166,6 +1174,17 @@ def run_clare_train_child(train_args: list[str]) -> int:
             if not (self.peft_cfg_path or self.peft_weight_path):
                 raise ValueError("One of peft_cfg_path or peft_weight_path must be specified")
 
+    update_dataclass_type_hints(
+        CLARETrainPipelineConfig,
+        {
+            "peft_cfg_path": ChildPath | None,
+            "peft_weight_path": ChildPath | None,
+            "train_discriminator_optimizer": OptimizerConfig,
+            "train_discriminator_lr_scheduler": LRSchedulerConfig | None,
+            "at_least_expand": Literal["shallowest", "deepest"],
+        },
+    )
+
     def set_peft_module_train(peft_modules: list[Any], train: bool = True) -> list[Any]:
         if not peft_modules:
             raise RuntimeError("No CLARE adapter modules were injected.")
@@ -1498,6 +1517,14 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
     class CLAREEvalPipelineConfig(EvalPipelineConfig):
         peft_weight_path: ChildPath | None = None
         dataset: DatasetConfig | None = None
+
+    update_dataclass_type_hints(
+        CLAREEvalPipelineConfig,
+        {
+            "peft_weight_path": ChildPath | None,
+            "dataset": DatasetConfig | None,
+        },
+    )
 
     def eval_main(cfg: CLAREEvalPipelineConfig) -> None:
         if cfg.peft_weight_path is None:
