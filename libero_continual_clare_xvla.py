@@ -1102,7 +1102,6 @@ def build_eval_args(config: Config, adapter_checkpoint: Path, suite: str, output
         f"--output_dir={output_dir}",
         f"--eval.batch_size={config.eval_batch_size}",
         f"--eval.n_episodes={config.n_eval_episodes}",
-        f"--eval.max_episodes_rendered=0",
         f"--policy.device={config.device}",
         f"--policy.action_mode={config.action_mode}",
         f"--policy.tokenizer_name={config.tokenizer_name}",
@@ -2091,7 +2090,9 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             raise ValueError("peft_weight_path is required for CLARE-X-VLA eval")
         device = get_safe_torch_device(cfg.policy.device, log=True)
         set_seed(cfg.seed)
-        env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+        use_async_envs = bool(getattr(cfg.eval, "use_async_envs", False))
+        max_episodes_rendered = int(getattr(cfg.eval, "max_episodes_rendered", 0) or 0)
+        env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=use_async_envs)
         ds_meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
         policy_meta = make_policy_compatible_metadata(ds_meta, cfg.policy, cfg.rename_map or {})
         policy = make_policy(cfg=cfg.policy, ds_meta=policy_meta)
@@ -2123,7 +2124,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
                 env,
                 policy,
                 cfg.eval.n_episodes,
-                max_episodes_rendered=cfg.eval.max_episodes_rendered,
+                max_episodes_rendered=max_episodes_rendered,
                 videos_dir=ChildPath(cfg.output_dir) / "videos",
                 start_seed=cfg.seed,
             )
