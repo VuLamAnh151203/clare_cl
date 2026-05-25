@@ -1859,6 +1859,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         OBS_LANGUAGE_TOKENS = "observation.language.tokens"
 
     OBS_LANGUAGE_ATTENTION_MASK = "observation.language.attention_mask"
+    OBS_STATE = "observation.state"
 
     class PeftWrapperPolicy(torch.nn.Module):
         policy: PreTrainedPolicy
