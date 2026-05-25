@@ -1303,7 +1303,6 @@ def run_clare_train_child(train_args: list[str]) -> int:
         )
         logging.info("Saved CLARE adapter to %s", adapter_dir)
 
-    @parser.wrap()
     def train(cfg: CLARETrainPipelineConfig) -> None:
         cfg.validate()
         if cfg.seed is not None:
@@ -1457,6 +1456,8 @@ def run_clare_train_child(train_args: list[str]) -> int:
 
     sys.argv = [sys.argv[0], *train_args]
     init_logging()
+    train.__annotations__["cfg"] = CLARETrainPipelineConfig
+    train = parser.wrap()(train)
     train()
     return 0
 
@@ -1498,7 +1499,6 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         peft_weight_path: ChildPath | None = None
         dataset: DatasetConfig | None = None
 
-    @parser.wrap()
     def eval_main(cfg: CLAREEvalPipelineConfig) -> None:
         if cfg.peft_weight_path is None:
             raise ValueError("peft_weight_path is required for CLARE-X-VLA eval")
@@ -1538,6 +1538,8 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
 
     sys.argv = [sys.argv[0], *eval_args]
     init_logging()
+    eval_main.__annotations__["cfg"] = CLAREEvalPipelineConfig
+    eval_main = parser.wrap()(eval_main)
     eval_main()
     return 0
 
