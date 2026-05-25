@@ -340,7 +340,7 @@ def load_config() -> Config:
         scheduler_warmup_steps=parse_int("SCHEDULER_WARMUP_STEPS", 1000),
         scheduler_decay_steps=parse_int("SCHEDULER_DECAY_STEPS", 30000),
         scheduler_decay_lr=env("SCHEDULER_DECAY_LR", "2.5e-6"),
-        action_mode=env("ACTION_MODE", "ee6d"),
+        action_mode=env("ACTION_MODE", "auto"),
         policy_use_proprio=parse_bool("POLICY_USE_PROPRIO", True),
         policy_num_image_views=parse_optional_int("POLICY_NUM_IMAGE_VIEWS"),
         policy_empty_cameras=parse_optional_int("POLICY_EMPTY_CAMERAS"),
@@ -2033,8 +2033,57 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             return [bool(value)] * num_envs
         return [False] * num_envs
 
+    def infer_action_dim_from_space(space: Any) -> int | None:
+        shape = getattr(space, "shape", None)
+        if shape:
+            return int(shape[-1])
+        return None
+
+    def infer_env_action_dim(env_object: Any, seen: set[int] | None = None) -> int | None:
+        if seen is None:
+            seen = set()
+        object_id = id(env_object)
+        if object_id in seen:
+            return None
+        seen.add(object_id)
+
+        for attr_name in ("single_action_space", "action_space"):
+            dim = infer_action_dim_from_space(getattr(env_object, attr_name, None))
+            if dim is not None:
+                return dim
+
+        action_dim = getattr(env_object, "action_dim", None)
+        if isinstance(action_dim, int) and action_dim > 0:
+            return action_dim
+
+        for child in getattr(env_object, "envs", []) or []:
+            dim = infer_env_action_dim(child, seen)
+            if dim is not None:
+                return dim
+
+        for attr_name in ("unwrapped", "env", "_env"):
+            child = getattr(env_object, attr_name, None)
+            if child is not None:
+                dim = infer_env_action_dim(child, seen)
+                if dim is not None:
+                    return dim
+        return None
+
+    def adapt_action_to_env(action: np.ndarray, env_action_dim: int | None) -> np.ndarray:
+        if env_action_dim is None or action.shape[-1] == env_action_dim:
+            return action
+        if action.shape[-1] > env_action_dim:
+            return action[..., :env_action_dim]
+
+        pad_shape = (*action.shape[:-1], env_action_dim - action.shape[-1])
+        padding = np.zeros(pad_shape, dtype=action.dtype)
+        return np.concatenate([action, padding], axis=-1)
+
     def local_rollout(env: Any, policy: PreTrainedPolicy, seeds: list[int] | None = None) -> dict[str, torch.Tensor]:
         device = get_device_from_parameters(policy)
+        env_action_dim = infer_env_action_dim(env)
+        if env_action_dim is None:
+            logging.warning("Could not infer env action dimension; using policy action shape directly.")
         policy.reset()
         observation, _info = env.reset(seed=seeds)
         if check_env_attributes_and_types is not None:
@@ -2059,6 +2108,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
                 action = policy.select_action(observation)
 
             action_np = action.detach().to("cpu").numpy()
+            action_np = adapt_action_to_env(action_np, env_action_dim)
             observation, reward, terminated, truncated, info = env.step(action_np)
             done = np.asarray(terminated) | np.asarray(truncated) | done
             successes = success_list_from_info(info, env.num_envs)
