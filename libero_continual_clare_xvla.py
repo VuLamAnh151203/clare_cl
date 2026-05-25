@@ -404,10 +404,25 @@ def install_dependencies(config: Config) -> None:
         ["imageio[ffmpeg]"],
         ["lerobot[libero]"],
         ["lerobot[xvla]"],
-        ["-e", str(config.clare_root / "peft_lsy")],
     ]
     for packages in package_groups:
         run_command([sys.executable, "-m", "pip", "install", *packages], config)
+
+    peft_project = config.clare_root / "peft_lsy"
+    if parse_bool("CLARE_INSTALL_EDITABLE", False):
+        if not peft_project.exists():
+            raise FileNotFoundError(f"CLARE PEFT project directory does not exist: {peft_project}")
+        if not ((peft_project / "setup.py").exists() or (peft_project / "pyproject.toml").exists()):
+            raise FileNotFoundError(
+                "CLARE_INSTALL_EDITABLE=1 was requested, but the PEFT directory is not installable: "
+                f"{peft_project}. Expected setup.py or pyproject.toml."
+            )
+        run_command([sys.executable, "-m", "pip", "install", "-e", str(peft_project)], config)
+    else:
+        print(
+            "Skipping editable install for CLARE PEFT. The runner loads it directly from "
+            f"{peft_project / 'src'}. Set CLARE_INSTALL_EDITABLE=1 to force `pip install -e`."
+        )
 
 
 def find_libero_benchmark_root() -> Path:
@@ -506,7 +521,19 @@ def convert_datasets(config: Config) -> None:
 def ensure_clare_peft_path(clare_root: Path) -> Path:
     peft_src = clare_root / "peft_lsy" / "src"
     if not peft_src.exists():
-        raise RuntimeError(f"Cannot find local CLARE PEFT source: {peft_src}")
+        existing = []
+        if clare_root.exists():
+            existing = sorted(path.name for path in clare_root.iterdir())
+        raise RuntimeError(
+            f"Cannot find local CLARE PEFT source: {peft_src}. "
+            f"CLARE_ROOT is {clare_root}. Entries there: {existing}. "
+            "Upload the full clare folder, or set CLARE_ROOT to the folder containing peft_lsy/src/peft."
+        )
+    if not (peft_src / "peft").exists():
+        raise RuntimeError(
+            f"CLARE PEFT source is missing the peft package: {peft_src / 'peft'}. "
+            "Upload clare/peft_lsy/src/peft completely."
+        )
     peft_src_str = str(peft_src.resolve())
     if peft_src_str not in sys.path:
         sys.path.insert(0, peft_src_str)
