@@ -408,6 +408,23 @@ def install_dependencies(config: Config) -> None:
     for packages in package_groups:
         run_command([sys.executable, "-m", "pip", "install", *packages], config)
 
+    if parse_bool("CLARE_UPGRADE_TRANSFORMERS", True):
+        transformers_version = os.environ.get("CLARE_TRANSFORMERS_VERSION", "4.53.3").strip()
+        if transformers_version:
+            transformers_spec = (
+                transformers_version
+                if any(op in transformers_version for op in ("=", "<", ">", "~", "!"))
+                else f"transformers=={transformers_version}"
+            )
+        else:
+            transformers_spec = "transformers>=4.53.0"
+        run_command([sys.executable, "-m", "pip", "install", "--upgrade", transformers_spec], config)
+    else:
+        print(
+            "Skipping transformers upgrade because CLARE_UPGRADE_TRANSFORMERS=0. "
+            "CLARE PEFT may require transformers with HybridCache support."
+        )
+
     peft_project = config.clare_root / "peft_lsy"
     if parse_bool("CLARE_INSTALL_EDITABLE", False):
         if not peft_project.exists():
@@ -573,6 +590,14 @@ def validate_runtime_imports(config: Config) -> None:
     try:
         from peft import CLAREConfig, PeftModel  # noqa: F401
     except Exception as exc:
+        if "HybridCache" in str(exc) or "transformers" in str(exc):
+            raise RuntimeError(
+                "Local CLARE PEFT was found, but it is not compatible with the installed transformers package. "
+                "CLARE's PEFT fork imports transformers.HybridCache, which is missing in older Kaggle images. "
+                "Use INSTALL_DEPS=1 with CLARE_UPGRADE_TRANSFORMERS=1, or run "
+                "`python -m pip install --upgrade \"transformers==4.53.3\"` before this script. "
+                "If a notebook imported transformers earlier, restart the Kaggle session after upgrading."
+            ) from exc
         raise RuntimeError(
             "Local CLARE PEFT is not importable. Check CLARE_ROOT and peft_lsy installation."
         ) from exc
