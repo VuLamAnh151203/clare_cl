@@ -2085,6 +2085,60 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             },
         }
 
+    def collect_vector_envs(env_object: Any, prefix: str = "env") -> list[tuple[str, Any]]:
+        if hasattr(env_object, "num_envs"):
+            return [(prefix, env_object)]
+        if not isinstance(env_object, dict):
+            return []
+        envs: list[tuple[str, Any]] = []
+        for key, value in env_object.items():
+            child_prefix = f"{prefix}.{key}"
+            envs.extend(collect_vector_envs(value, child_prefix))
+        return envs
+
+    def merge_eval_infos(infos: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+        per_episode: list[dict[str, Any]] = []
+        per_env: dict[str, Any] = {}
+        elapsed = 0.0
+        for env_name, info in infos:
+            per_env[env_name] = info.get("aggregated", {})
+            elapsed += float(info.get("aggregated", {}).get("eval_s", 0.0))
+            for episode in info.get("per_episode", []):
+                merged_episode = dict(episode)
+                merged_episode["env_name"] = env_name
+                merged_episode["episode_ix"] = len(per_episode)
+                per_episode.append(merged_episode)
+
+        if not per_episode:
+            raise RuntimeError("Evaluation produced no episodes.")
+
+        sum_rewards = [float(ep["sum_reward"]) for ep in per_episode]
+        max_rewards = [float(ep["max_reward"]) for ep in per_episode]
+        successes = [bool(ep["success"]) for ep in per_episode]
+        return {
+            "per_episode": per_episode,
+            "per_env": per_env,
+            "aggregated": {
+                "avg_sum_reward": float(np.nanmean(sum_rewards)),
+                "avg_max_reward": float(np.nanmean(max_rewards)),
+                "pc_success": float(np.nanmean(successes) * 100),
+                "eval_s": elapsed,
+                "eval_ep_s": elapsed / len(per_episode),
+            },
+        }
+
+    def close_vector_envs(env_items: list[tuple[str, Any]]) -> None:
+        closed: set[int] = set()
+        for _env_name, env in env_items:
+            env_id = id(env)
+            if env_id in closed:
+                continue
+            closed.add(env_id)
+            try:
+                env.close()
+            except Exception as exc:
+                logging.warning("Failed to close eval env cleanly: %s", exc)
+
     def eval_main(cfg: CLAREEvalPipelineConfig) -> None:
         if cfg.peft_weight_path is None:
             raise ValueError("peft_weight_path is required for CLARE-X-VLA eval")
@@ -2092,7 +2146,14 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         set_seed(cfg.seed)
         use_async_envs = bool(getattr(cfg.eval, "use_async_envs", False))
         max_episodes_rendered = int(getattr(cfg.eval, "max_episodes_rendered", 0) or 0)
-        env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=use_async_envs)
+        env_object = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=use_async_envs)
+        env_items = collect_vector_envs(env_object)
+        if not env_items:
+            if isinstance(env_object, dict):
+                raise RuntimeError(
+                    f"make_env returned a dict, but no vector env was found inside. Keys: {list(env_object.keys())}"
+                )
+            raise RuntimeError(f"make_env returned unsupported object type: {type(env_object).__name__}")
         ds_meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
         policy_meta = make_policy_compatible_metadata(ds_meta, cfg.policy, cfg.rename_map or {})
         policy = make_policy(cfg=cfg.policy, ds_meta=policy_meta)
@@ -2119,15 +2180,23 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         policy.select_action = select_action_with_xvla_inputs
         policy.forward = forward_with_xvla_inputs
         policy.eval()
-        with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-            info = eval_policy(
-                env,
-                policy,
-                cfg.eval.n_episodes,
-                max_episodes_rendered=max_episodes_rendered,
-                videos_dir=ChildPath(cfg.output_dir) / "videos",
-                start_seed=cfg.seed,
-            )
+        infos: list[tuple[str, dict[str, Any]]] = []
+        try:
+            with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+                for env_name, env in env_items:
+                    logging.info("Evaluating %s with %s parallel env(s)", env_name, env.num_envs)
+                    info = eval_policy(
+                        env,
+                        policy,
+                        cfg.eval.n_episodes,
+                        max_episodes_rendered=max_episodes_rendered,
+                        videos_dir=ChildPath(cfg.output_dir) / "videos",
+                        start_seed=cfg.seed,
+                    )
+                    infos.append((env_name, info))
+        finally:
+            close_vector_envs(env_items)
+        info = infos[0][1] if len(infos) == 1 else merge_eval_infos(infos)
         ChildPath(cfg.output_dir).mkdir(parents=True, exist_ok=True)
         with (ChildPath(cfg.output_dir) / "eval_info.json").open("w", encoding="utf-8") as handle:
             child_json.dump(info, handle, indent=2)
@@ -2135,7 +2204,6 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         pc_success = float(info["aggregated"]["pc_success"])
         print(child_json.dumps(info["aggregated"], indent=2))
         print(f"success: {pc_success:.3f}%")
-        env.close()
         logging.info("End of CLARE-X-VLA eval")
 
     sys.argv = [sys.argv[0], *eval_args]
