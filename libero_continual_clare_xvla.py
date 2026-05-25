@@ -1811,10 +1811,12 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
 
     import json as child_json
     import logging
+    import time
     from contextlib import nullcontext
     from dataclasses import dataclass, field
     from pathlib import Path as ChildPath
 
+    import numpy as np
     import torch
 
     from lerobot.configs import parser
@@ -1822,9 +1824,25 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
     from lerobot.configs.eval import EvalPipelineConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
     from lerobot.envs.factory import make_env
+    try:
+        from lerobot.envs.utils import check_env_attributes_and_types, preprocess_observation
+    except ImportError:
+        check_env_attributes_and_types = None
+
+        def preprocess_observation(observation: dict[str, Any]) -> dict[str, Any]:
+            for key, value in list(observation.items()):
+                if isinstance(value, np.ndarray):
+                    observation[key] = torch.from_numpy(value)
+            return observation
+
     from lerobot.policies.factory import make_policy
     from lerobot.policies.pretrained import PreTrainedPolicy
-    from lerobot.scripts.eval import eval_policy
+    try:
+        from lerobot.policies.utils import get_device_from_parameters
+    except ImportError:
+        def get_device_from_parameters(module: torch.nn.Module) -> torch.device:
+            return next(module.parameters()).device
+
     from lerobot.utils.random_utils import set_seed
     from peft import PeftModel
     from transformers import AutoTokenizer
@@ -1936,6 +1954,137 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         batch = apply_rename_map_to_batch(batch, cfg.rename_map or {})
         batch = add_xvla_language_and_domain(batch, cfg, tokenizer)
         return move_batch_to_device(batch, device)
+
+    def success_list_from_info(info: dict[str, Any], num_envs: int) -> list[bool]:
+        if "final_info" in info:
+            successes = []
+            for final_info in info["final_info"]:
+                if final_info is None:
+                    successes.append(False)
+                else:
+                    successes.append(bool(final_info.get("is_success", False)))
+            return successes
+        if "is_success" in info:
+            value = info["is_success"]
+            if isinstance(value, torch.Tensor):
+                return [bool(item) for item in value.detach().cpu().flatten().tolist()]
+            if isinstance(value, np.ndarray):
+                return [bool(item) for item in value.flatten().tolist()]
+            if isinstance(value, (list, tuple)):
+                return [bool(item) for item in value]
+            return [bool(value)] * num_envs
+        return [False] * num_envs
+
+    def local_rollout(env: Any, policy: PreTrainedPolicy, seeds: list[int] | None = None) -> dict[str, torch.Tensor]:
+        device = get_device_from_parameters(policy)
+        policy.reset()
+        observation, _info = env.reset(seed=seeds)
+        if check_env_attributes_and_types is not None:
+            check_env_attributes_and_types(env)
+
+        done = np.array([False] * env.num_envs)
+        max_steps = int(env.call("_max_episode_steps")[0])
+        all_actions: list[torch.Tensor] = []
+        all_rewards: list[torch.Tensor] = []
+        all_successes: list[torch.Tensor] = []
+        all_dones: list[torch.Tensor] = []
+
+        for _step in range(max_steps):
+            if np.all(done):
+                break
+            observation = preprocess_observation(observation)
+            for key in observation:
+                if isinstance(observation[key], torch.Tensor):
+                    observation[key] = observation[key].to(device, non_blocking=device.type == "cuda")
+
+            with torch.inference_mode():
+                action = policy.select_action(observation)
+
+            action_np = action.detach().to("cpu").numpy()
+            observation, reward, terminated, truncated, info = env.step(action_np)
+            done = np.asarray(terminated) | np.asarray(truncated) | done
+            successes = success_list_from_info(info, env.num_envs)
+
+            all_actions.append(torch.from_numpy(action_np))
+            all_rewards.append(torch.as_tensor(reward))
+            all_successes.append(torch.tensor(successes))
+            all_dones.append(torch.from_numpy(done.copy()))
+
+        if not all_actions:
+            raise RuntimeError("Evaluation rollout finished before any action was produced.")
+
+        return {
+            "action": torch.stack(all_actions, dim=1),
+            "reward": torch.stack(all_rewards, dim=1),
+            "success": torch.stack(all_successes, dim=1),
+            "done": torch.stack(all_dones, dim=1),
+        }
+
+    def eval_policy(
+        env: Any,
+        policy: PreTrainedPolicy,
+        n_episodes: int,
+        max_episodes_rendered: int = 0,
+        videos_dir: ChildPath | None = None,
+        start_seed: int | None = None,
+    ) -> dict[str, Any]:
+        if max_episodes_rendered > 0:
+            logging.warning("Video rendering is not supported by the local CLARE-X-VLA eval loop; skipping videos.")
+        start = time.time()
+        policy.eval()
+        n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
+        sum_rewards: list[float] = []
+        max_rewards: list[float] = []
+        all_successes: list[bool] = []
+        all_seeds: list[int | None] = []
+
+        for batch_ix in range(n_batches):
+            if start_seed is None:
+                seeds = None
+            else:
+                seeds = list(range(start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)))
+            rollout_data = local_rollout(env, policy, seeds=seeds)
+            n_steps = rollout_data["done"].shape[1]
+            done_indices = torch.argmax(rollout_data["done"].to(torch.int64), dim=1)
+            mask = torch.arange(n_steps).unsqueeze(0) <= (done_indices + 1).unsqueeze(1)
+
+            batch_sum_rewards = (rollout_data["reward"] * mask).sum(dim=1)
+            batch_max_rewards = rollout_data["reward"].masked_fill(~mask, float("-inf")).max(dim=1).values
+            batch_successes = (rollout_data["success"] & mask).any(dim=1)
+
+            sum_rewards.extend(float(item) for item in batch_sum_rewards.tolist())
+            max_rewards.extend(float(item) for item in batch_max_rewards.tolist())
+            all_successes.extend(bool(item) for item in batch_successes.tolist())
+            all_seeds.extend(seeds if seeds is not None else [None] * env.num_envs)
+
+        elapsed = time.time() - start
+        return {
+            "per_episode": [
+                {
+                    "episode_ix": i,
+                    "sum_reward": sum_reward,
+                    "max_reward": max_reward,
+                    "success": success,
+                    "seed": seed,
+                }
+                for i, (sum_reward, max_reward, success, seed) in enumerate(
+                    zip(
+                        sum_rewards[:n_episodes],
+                        max_rewards[:n_episodes],
+                        all_successes[:n_episodes],
+                        all_seeds[:n_episodes],
+                        strict=True,
+                    )
+                )
+            ],
+            "aggregated": {
+                "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
+                "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
+                "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
+                "eval_s": elapsed,
+                "eval_ep_s": elapsed / n_episodes,
+            },
+        }
 
     def eval_main(cfg: CLAREEvalPipelineConfig) -> None:
         if cfg.peft_weight_path is None:
