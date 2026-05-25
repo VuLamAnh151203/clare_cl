@@ -9,6 +9,7 @@ runner. It keeps CLARE-specific training/evaluation isolated so the original
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import os
 import re
@@ -71,6 +72,16 @@ def parse_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def parse_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
     try:
         return int(raw)
     except ValueError as exc:
@@ -195,8 +206,8 @@ class Config:
     scheduler_decay_steps: int
     scheduler_decay_lr: str
     action_mode: str
-    policy_num_image_views: int
-    policy_empty_cameras: int
+    policy_num_image_views: int | None
+    policy_empty_cameras: int | None
     freeze_vision_encoder: bool
     freeze_language_encoder: bool
     train_policy_transformer: bool
@@ -329,8 +340,8 @@ def load_config() -> Config:
         scheduler_decay_steps=parse_int("SCHEDULER_DECAY_STEPS", 30000),
         scheduler_decay_lr=env("SCHEDULER_DECAY_LR", "2.5e-6"),
         action_mode=env("ACTION_MODE", "ee6d"),
-        policy_num_image_views=parse_int("POLICY_NUM_IMAGE_VIEWS", 3),
-        policy_empty_cameras=parse_int("POLICY_EMPTY_CAMERAS", 1),
+        policy_num_image_views=parse_optional_int("POLICY_NUM_IMAGE_VIEWS"),
+        policy_empty_cameras=parse_optional_int("POLICY_EMPTY_CAMERAS"),
         freeze_vision_encoder=parse_bool("FREEZE_VISION_ENCODER", False),
         freeze_language_encoder=parse_bool("FREEZE_LANGUAGE_ENCODER", False),
         train_policy_transformer=parse_bool("TRAIN_POLICY_TRANSFORMER", True),
@@ -686,6 +697,60 @@ def update_dataclass_type_hints(dataclass_type: type[Any], hints: dict[str, Any]
             dataclass_fields[name].type = hint
 
 
+def metadata_feature_mappings(meta: Any) -> list[dict[str, Any]]:
+    mappings: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    features = getattr(meta, "features", None)
+    if isinstance(features, dict):
+        mappings.append(features)
+        seen.add(id(features))
+    info = getattr(meta, "info", None)
+    if isinstance(info, dict):
+        info_features = info.get("features")
+        if isinstance(info_features, dict) and id(info_features) not in seen:
+            mappings.append(info_features)
+    return mappings
+
+
+def metadata_stats_mappings(meta: Any) -> list[dict[str, Any]]:
+    stats = getattr(meta, "stats", None)
+    return [stats] if isinstance(stats, dict) else []
+
+
+def apply_rename_map_to_mapping(mapping: dict[str, Any], rename_map: dict[str, str]) -> None:
+    for source, target in rename_map.items():
+        if source not in mapping:
+            continue
+        if target not in mapping:
+            mapping[target] = copy.deepcopy(mapping[source])
+        del mapping[source]
+
+
+def add_empty_camera_features(mapping: dict[str, Any], empty_cameras: int) -> None:
+    if empty_cameras <= 0:
+        return
+    template = mapping.get("observation.images.image")
+    if template is None:
+        template = next(
+            (value for key, value in mapping.items() if key.startswith("observation.images.")),
+            None,
+        )
+    if template is None:
+        return
+    for camera_idx in range(empty_cameras):
+        key = f"observation.images.empty_camera_{camera_idx}"
+        if key not in mapping:
+            mapping[key] = copy.deepcopy(template)
+
+
+def apply_policy_feature_compatibility(meta: Any, policy_cfg: Any, rename_map: dict[str, str]) -> None:
+    for features in metadata_feature_mappings(meta):
+        apply_rename_map_to_mapping(features, rename_map)
+        add_empty_camera_features(features, int(getattr(policy_cfg, "empty_cameras", 0) or 0))
+    for stats in metadata_stats_mappings(meta):
+        apply_rename_map_to_mapping(stats, rename_map)
+
+
 def module_is_excluded(name: str) -> bool:
     lowered = name.lower()
     excluded_tokens = (
@@ -853,8 +918,6 @@ def build_common_train_args(config: Config, suite: str, output_dir: Path) -> lis
         f"--policy.scheduler_decay_steps={config.scheduler_decay_steps}",
         f"--policy.scheduler_decay_lr={config.scheduler_decay_lr}",
         f"--policy.action_mode={config.action_mode}",
-        f"--policy.num_image_views={config.policy_num_image_views}",
-        f"--policy.empty_cameras={config.policy_empty_cameras}",
         f"--policy.freeze_vision_encoder={cli_bool(config.freeze_vision_encoder)}",
         f"--policy.freeze_language_encoder={cli_bool(config.freeze_language_encoder)}",
         f"--policy.train_policy_transformer={cli_bool(config.train_policy_transformer)}",
@@ -875,6 +938,10 @@ def build_common_train_args(config: Config, suite: str, output_dir: Path) -> lis
     ]
     if config.policy_dtype:
         args.append(f"--policy.dtype={config.policy_dtype}")
+    if config.policy_num_image_views is not None:
+        args.append(f"--policy.num_image_views={config.policy_num_image_views}")
+    if config.policy_empty_cameras is not None:
+        args.append(f"--policy.empty_cameras={config.policy_empty_cameras}")
     return args
 
 
@@ -911,7 +978,8 @@ def train_suite(config: Config, suite: str, previous_adapter: Path | None) -> Pa
 
 def build_eval_args(config: Config, adapter_checkpoint: Path, suite: str, output_dir: Path) -> list[str]:
     root = require_dataset_root(config, suite)
-    return [
+    rename_map = json.dumps(config.rename_map, separators=(",", ":"))
+    args = [
         f"--policy.path={config.base_model}",
         f"--peft_weight_path={adapter_checkpoint}",
         f"--dataset.repo_id={config.dataset_repo_ids[suite]}",
@@ -925,9 +993,13 @@ def build_eval_args(config: Config, adapter_checkpoint: Path, suite: str, output
         f"--eval.max_episodes_rendered=0",
         f"--policy.device={config.device}",
         f"--policy.action_mode={config.action_mode}",
-        f"--policy.num_image_views={config.policy_num_image_views}",
-        f"--policy.empty_cameras={config.policy_empty_cameras}",
+        f"--rename_map={rename_map}",
     ]
+    if config.policy_num_image_views is not None:
+        args.append(f"--policy.num_image_views={config.policy_num_image_views}")
+    if config.policy_empty_cameras is not None:
+        args.append(f"--policy.empty_cameras={config.policy_empty_cameras}")
+    return args
 
 
 def parse_success_rate(stdout: str) -> float | None:
@@ -1333,6 +1405,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
         logging.info("Creating X-VLA policy")
+        apply_policy_feature_compatibility(dataset.meta, cfg.policy, getattr(cfg, "rename_map", {}) or {})
         policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta)
         policy.eval()
         wrapper = PeftWrapperPolicy(policy=policy)
@@ -1488,7 +1561,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
     import json as child_json
     import logging
     from contextlib import nullcontext
-    from dataclasses import dataclass
+    from dataclasses import dataclass, field
     from pathlib import Path as ChildPath
 
     import torch
@@ -1517,12 +1590,14 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
     class CLAREEvalPipelineConfig(EvalPipelineConfig):
         peft_weight_path: ChildPath | None = None
         dataset: DatasetConfig | None = None
+        rename_map: dict[str, str] = field(default_factory=dict)
 
     update_dataclass_type_hints(
         CLAREEvalPipelineConfig,
         {
             "peft_weight_path": ChildPath | None,
             "dataset": DatasetConfig | None,
+            "rename_map": dict[str, str],
         },
     )
 
@@ -1533,6 +1608,7 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         set_seed(cfg.seed)
         env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
         ds_meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
+        apply_policy_feature_compatibility(ds_meta, cfg.policy, cfg.rename_map or {})
         policy = make_policy(cfg=cfg.policy, ds_meta=ds_meta)
         wrapper = PeftWrapperPolicy(policy=policy)
         peft_policy = PeftModel.from_pretrained(
