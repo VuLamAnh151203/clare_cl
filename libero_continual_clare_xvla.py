@@ -1020,11 +1020,15 @@ def build_common_train_args(config: Config, suite: str, output_dir: Path) -> lis
         f"--policy.scheduler_decay_steps={config.scheduler_decay_steps}",
         f"--policy.scheduler_decay_lr={config.scheduler_decay_lr}",
         f"--policy.action_mode={config.action_mode}",
+        f"--policy.tokenizer_name={config.tokenizer_name}",
+        f"--policy.tokenizer_max_length={config.tokenizer_max_length}",
         f"--policy.freeze_vision_encoder={cli_bool(config.freeze_vision_encoder)}",
         f"--policy.freeze_language_encoder={cli_bool(config.freeze_language_encoder)}",
         f"--policy.train_policy_transformer={cli_bool(config.train_policy_transformer)}",
         f"--policy.train_soft_prompts={cli_bool(config.train_soft_prompts)}",
         f"--rename_map={rename_map}",
+        f"--tokenizer_task_key={config.tokenizer_task_key}",
+        f"--domain_id={config.domain_id}",
         f"--expand_threshold={config.clare_expand_threshold}",
         f"--detect_distribution_shift_steps={config.clare_detect_steps}",
         f"--detect_distribution_shift_batch_size={config.clare_detect_batch_size}",
@@ -1306,8 +1310,15 @@ def run_clare_train_child(train_args: list[str]) -> int:
     from lerobot.utils.random_utils import set_seed
     from peft import PeftConfig, PeftModel, get_peft_model
     from peft.mapping import PEFT_TYPE_TO_PREFIX_MAPPING
+    from transformers import AutoTokenizer
 
     get_safe_torch_device, init_logging = import_lerobot_runtime_helpers()
+    try:
+        from lerobot.utils.constants import OBS_LANGUAGE_TOKENS
+    except ImportError:
+        OBS_LANGUAGE_TOKENS = "observation.language.tokens"
+
+    OBS_LANGUAGE_ATTENTION_MASK = "observation.language.attention_mask"
 
     class PeftWrapperPolicy(torch.nn.Module):
         policy: PreTrainedPolicy
@@ -1343,6 +1354,8 @@ def run_clare_train_child(train_args: list[str]) -> int:
         maximum_expand: int = 10000
         expand_threshold: float = 1.0
         at_least_expand: Literal["shallowest", "deepest"] = "shallowest"
+        tokenizer_task_key: str = "task"
+        domain_id: int = 3
 
         def __post_init__(self) -> None:
             if not (self.peft_cfg_path or self.peft_weight_path):
@@ -1356,6 +1369,8 @@ def run_clare_train_child(train_args: list[str]) -> int:
             "train_discriminator_optimizer": OptimizerConfig,
             "train_discriminator_lr_scheduler": LRSchedulerConfig | None,
             "at_least_expand": Literal["shallowest", "deepest"],
+            "tokenizer_task_key": str,
+            "domain_id": int,
         },
     )
 
@@ -1377,12 +1392,63 @@ def run_clare_train_child(train_args: list[str]) -> int:
                 batch[key] = batch[key].to(device, non_blocking=device.type == "cuda")
         return batch
 
+    def infer_batch_size(batch: dict[str, Any]) -> int:
+        for value in batch.values():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+            if isinstance(value, (list, tuple)):
+                return len(value)
+        return 1
+
+    def normalize_task_texts(raw_tasks: Any, batch_size: int) -> list[str]:
+        if raw_tasks is None:
+            tasks = [""]
+        elif isinstance(raw_tasks, str):
+            tasks = [raw_tasks]
+        elif isinstance(raw_tasks, torch.Tensor):
+            tasks = [str(item) for item in raw_tasks.detach().cpu().tolist()]
+        elif isinstance(raw_tasks, (list, tuple)):
+            tasks = [str(item) for item in raw_tasks]
+        else:
+            tasks = [str(raw_tasks)]
+        if len(tasks) == 1 and batch_size > 1:
+            tasks = tasks * batch_size
+        if len(tasks) != batch_size:
+            tasks = (tasks + [tasks[-1] if tasks else ""] * batch_size)[:batch_size]
+        return tasks
+
+    def add_xvla_language_and_domain(
+        batch: dict[str, Any],
+        cfg: CLARETrainPipelineConfig,
+        tokenizer: Any,
+    ) -> dict[str, Any]:
+        batch_size = infer_batch_size(batch)
+        if OBS_LANGUAGE_TOKENS not in batch:
+            tasks = normalize_task_texts(batch.get(cfg.tokenizer_task_key, batch.get("task")), batch_size)
+            tokenizer.padding_side = getattr(cfg.policy, "tokenizer_padding_side", "right")
+            encoded = tokenizer(
+                tasks,
+                padding=getattr(cfg.policy, "pad_language_to", "max_length"),
+                truncation=True,
+                max_length=int(getattr(cfg.policy, "tokenizer_max_length", 50)),
+                return_tensors="pt",
+            )
+            batch[OBS_LANGUAGE_TOKENS] = encoded["input_ids"]
+            if "attention_mask" in encoded:
+                batch[OBS_LANGUAGE_ATTENTION_MASK] = encoded["attention_mask"]
+        if "domain_id" not in batch:
+            batch["domain_id"] = torch.full((batch_size,), int(cfg.domain_id), dtype=torch.long)
+        return batch
+
     def prepare_batch(
         batch: dict[str, Any],
+        cfg: CLARETrainPipelineConfig,
         device: torch.device,
         rename_map: dict[str, str],
+        tokenizer: Any,
     ) -> dict[str, Any]:
         batch = apply_rename_map_to_batch(batch, rename_map)
+        batch = add_xvla_language_and_domain(batch, cfg, tokenizer)
         return move_batch_to_device(batch, device)
 
     def detect_distribution_shift(
@@ -1391,6 +1457,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
         peft_modules: list[Any],
         dataset: Any,
         device: torch.device,
+        tokenizer: Any,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         if cfg.detect_distribution_shift_steps <= 0:
             raise RuntimeError("detect_distribution_shift_steps must be > 0 for later CLARE stages")
@@ -1410,7 +1477,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
         losses_sum: dict[str, list[float]] = {}
         step = 0
         for _ in range(cfg.detect_distribution_shift_steps):
-            batch = prepare_batch(next(detect_iter), device, getattr(cfg, "rename_map", {}) or {})
+            batch = prepare_batch(next(detect_iter), cfg, device, getattr(cfg, "rename_map", {}) or {}, tokenizer)
             with torch.inference_mode():
                 policy.forward(batch)
             for peft_module in peft_modules:
@@ -1559,6 +1626,10 @@ def run_clare_train_child(train_args: list[str]) -> int:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
+        tokenizer_name = getattr(cfg.policy, "tokenizer_name", "facebook/bart-large")
+        logging.info("Loading tokenizer for X-VLA language inputs: %s", tokenizer_name)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
         logging.info("Creating X-VLA policy")
@@ -1603,7 +1674,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
                     peft_module.num_discriminators,
                 ]
         else:
-            z_scores_mean, losses_mean = detect_distribution_shift(cfg, policy, peft_modules, dataset, device)
+            z_scores_mean, losses_mean = detect_distribution_shift(cfg, policy, peft_modules, dataset, device, tokenizer)
             only_forward_ids: list[int] = []
             to_expand_or_not: list[bool] = []
             for peft_module in peft_modules:
@@ -1678,7 +1749,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
             peft_module.train_discriminator(False)
             peft_module.update_stats(False)
         for _ in range(cfg.steps):
-            batch = prepare_batch(next(iterator), device, getattr(cfg, "rename_map", {}) or {})
+            batch = prepare_batch(next(iterator), cfg, device, getattr(cfg, "rename_map", {}) or {}, tokenizer)
             loss = update_policy(
                 policy,
                 peft_modules,
@@ -1698,7 +1769,7 @@ def run_clare_train_child(train_args: list[str]) -> int:
             peft_module.train_discriminator(True)
             peft_module.update_stats(True)
         for _ in range(cfg.train_discriminators_steps):
-            batch = prepare_batch(next(iterator), device, getattr(cfg, "rename_map", {}) or {})
+            batch = prepare_batch(next(iterator), cfg, device, getattr(cfg, "rename_map", {}) or {}, tokenizer)
             loss = update_policy(
                 policy,
                 peft_modules,
