@@ -398,13 +398,19 @@ def run_command(command: list[str | Path], config: Config, capture: bool = False
     if config.dry_run:
         return subprocess.CompletedProcess([str(part) for part in command], 0, stdout="", stderr="")
     if capture:
-        return subprocess.run(
-            [str(part) for part in command],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        try:
+            return subprocess.run(
+                [str(part) for part in command],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as exc:
+            output = exc.stdout or exc.output
+            if output:
+                print(output)
+            raise
     return subprocess.run([str(part) for part in command], check=True, text=True)
 
 
@@ -1099,7 +1105,11 @@ def build_eval_args(config: Config, adapter_checkpoint: Path, suite: str, output
         f"--eval.max_episodes_rendered=0",
         f"--policy.device={config.device}",
         f"--policy.action_mode={config.action_mode}",
+        f"--policy.tokenizer_name={config.tokenizer_name}",
+        f"--policy.tokenizer_max_length={config.tokenizer_max_length}",
         f"--rename_map={rename_map}",
+        f"--tokenizer_task_key={config.tokenizer_task_key}",
+        f"--domain_id={config.domain_id}",
     ]
     if config.policy_num_image_views is not None:
         args.append(f"--policy.num_image_views={config.policy_num_image_views}")
@@ -1817,8 +1827,15 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
     from lerobot.scripts.eval import eval_policy
     from lerobot.utils.random_utils import set_seed
     from peft import PeftModel
+    from transformers import AutoTokenizer
 
     get_safe_torch_device, init_logging = import_lerobot_runtime_helpers()
+    try:
+        from lerobot.utils.constants import OBS_LANGUAGE_TOKENS
+    except ImportError:
+        OBS_LANGUAGE_TOKENS = "observation.language.tokens"
+
+    OBS_LANGUAGE_ATTENTION_MASK = "observation.language.attention_mask"
 
     class PeftWrapperPolicy(torch.nn.Module):
         policy: PreTrainedPolicy
@@ -1832,6 +1849,8 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         peft_weight_path: ChildPath | None = None
         dataset: DatasetConfig | None = None
         rename_map: dict[str, str] = field(default_factory=dict)
+        tokenizer_task_key: str = "task"
+        domain_id: int = 3
 
     update_dataclass_type_hints(
         CLAREEvalPipelineConfig,
@@ -1839,8 +1858,84 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
             "peft_weight_path": ChildPath | None,
             "dataset": DatasetConfig | None,
             "rename_map": dict[str, str],
+            "tokenizer_task_key": str,
+            "domain_id": int,
         },
     )
+
+    def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+        for key in batch:
+            if isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key].to(device, non_blocking=device.type == "cuda")
+        return batch
+
+    def infer_batch_size(batch: dict[str, Any]) -> int:
+        for value in batch.values():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+            if isinstance(value, (list, tuple)):
+                return len(value)
+        return 1
+
+    def default_task_text(cfg: CLAREEvalPipelineConfig) -> str:
+        task = getattr(cfg.env, "task", "")
+        return str(task if task is not None else "")
+
+    def normalize_task_texts(raw_tasks: Any, batch_size: int, fallback: str) -> list[str]:
+        if raw_tasks is None:
+            tasks = [fallback]
+        elif isinstance(raw_tasks, str):
+            tasks = [raw_tasks]
+        elif isinstance(raw_tasks, torch.Tensor):
+            tasks = [str(item) for item in raw_tasks.detach().cpu().tolist()]
+        elif isinstance(raw_tasks, (list, tuple)):
+            tasks = [str(item) for item in raw_tasks]
+        else:
+            tasks = [str(raw_tasks)]
+        if len(tasks) == 1 and batch_size > 1:
+            tasks = tasks * batch_size
+        if len(tasks) != batch_size:
+            tasks = (tasks + [tasks[-1] if tasks else fallback] * batch_size)[:batch_size]
+        return tasks
+
+    def add_xvla_language_and_domain(
+        batch: dict[str, Any],
+        cfg: CLAREEvalPipelineConfig,
+        tokenizer: Any,
+    ) -> dict[str, Any]:
+        batch_size = infer_batch_size(batch)
+        if OBS_LANGUAGE_TOKENS not in batch:
+            tasks = normalize_task_texts(
+                batch.get(cfg.tokenizer_task_key, batch.get("task")),
+                batch_size,
+                default_task_text(cfg),
+            )
+            tokenizer.padding_side = getattr(cfg.policy, "tokenizer_padding_side", "right")
+            encoded = tokenizer(
+                tasks,
+                padding=getattr(cfg.policy, "pad_language_to", "max_length"),
+                truncation=True,
+                max_length=int(getattr(cfg.policy, "tokenizer_max_length", 50)),
+                return_tensors="pt",
+            )
+            batch[OBS_LANGUAGE_TOKENS] = encoded["input_ids"]
+            if "attention_mask" in encoded:
+                batch[OBS_LANGUAGE_ATTENTION_MASK] = encoded["attention_mask"]
+        if "domain_id" not in batch:
+            batch["domain_id"] = torch.full((batch_size,), int(cfg.domain_id), dtype=torch.long)
+        return batch
+
+    def prepare_eval_batch(
+        batch: Any,
+        cfg: CLAREEvalPipelineConfig,
+        device: torch.device,
+        tokenizer: Any,
+    ) -> Any:
+        if not isinstance(batch, dict):
+            return batch
+        batch = apply_rename_map_to_batch(batch, cfg.rename_map or {})
+        batch = add_xvla_language_and_domain(batch, cfg, tokenizer)
+        return move_batch_to_device(batch, device)
 
     def eval_main(cfg: CLAREEvalPipelineConfig) -> None:
         if cfg.peft_weight_path is None:
@@ -1860,6 +1955,19 @@ def run_clare_eval_child(eval_args: list[str]) -> int:
         )
         if not peft_policy.base_model.adapter_layers:
             raise RuntimeError("Loaded CLARE adapter has no adapter layers")
+        tokenizer_name = getattr(cfg.policy, "tokenizer_name", None) or getattr(cfg.policy, "pretrained_model_name_or_path", None)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        original_select_action = policy.select_action
+        original_forward = policy.forward
+
+        def select_action_with_xvla_inputs(batch: Any, *args: Any, **kwargs: Any) -> Any:
+            return original_select_action(prepare_eval_batch(batch, cfg, device, tokenizer), *args, **kwargs)
+
+        def forward_with_xvla_inputs(batch: Any, *args: Any, **kwargs: Any) -> Any:
+            return original_forward(prepare_eval_batch(batch, cfg, device, tokenizer), *args, **kwargs)
+
+        policy.select_action = select_action_with_xvla_inputs
+        policy.forward = forward_with_xvla_inputs
         policy.eval()
         with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
             info = eval_policy(
